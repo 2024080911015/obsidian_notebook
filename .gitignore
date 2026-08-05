@@ -1,0 +1,9 @@
+# Obsidian Remotely Save
+.obsidian/plugins/remotely-save/
+
+# Obsidian workspace state
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+
+# Trash
+.trash/
