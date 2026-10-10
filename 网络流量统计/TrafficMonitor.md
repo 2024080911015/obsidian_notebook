@@ -236,6 +236,7 @@ powershell -ExecutionPolicy Bypass -File .\TrafficMonitor.ps1 -Action report -Da
 | `monitor.log` | 运行日志（超 1 MB 自动只留最后 1000 行） |
 | `monitor.lock` | 单实例锁 |
 | `TrafficMonitor.ps1` | `install` 时自动复制的脚本副本（计划任务执行的是它，所以原文件改名/移动不影响运行） |
+| `TrafficMonitor.cmd` | `install` 时一并复制的启动器，在安装目录里直接双击即可看用量 |
 
 ### 4.6 两种自启模式
 

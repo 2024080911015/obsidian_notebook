@@ -944,6 +944,17 @@ function Install-Monitor {
         Write-Host (' 脚本已复制到：{0}' -f $target)
     }
 
+    # 同目录的启动器 TrafficMonitor.cmd 一并复制，让安装目录自给自足（可双击看用量）
+    $selfDir = Split-Path -Parent $self
+    $selfCmd = Join-Path $selfDir 'TrafficMonitor.cmd'
+    if (Test-Path -LiteralPath $selfCmd) {
+        $targetCmd = Join-Path $Script:StateDir 'TrafficMonitor.cmd'
+        if ([System.IO.Path]::GetFullPath($selfCmd) -ne [System.IO.Path]::GetFullPath($targetCmd)) {
+            Copy-Item -LiteralPath $selfCmd -Destination $targetCmd -Force
+            Write-Host (' 启动器已复制到：{0}' -f $targetCmd)
+        }
+    }
+
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     $mode = $InstallMode
     if ($mode -eq 'auto') { if ($isAdmin) { $mode = 'startup' } else { $mode = 'logon' } }
