@@ -195,6 +195,7 @@ powershell -ExecutionPolicy Bypass -File .\TrafficMonitor.ps1 -Action report -Da
 | `-StatePath` | `C:\ProgramData\TrafficMonitor\state.json` | 账本位置；若指向目录会自动追加 `state.json` |
 | `-Provider` | `auto` | 采集方式：`netadapter` / `perfcounter` / `auto`（优先前者，失败自动降级） |
 | `-InstallMode` | `auto` | `auto`＝管理员用开机启动，否则用登录时启动；可强制 `startup` / `logon` |
+| `-WatchdogMinutes` | `5` | 自愈检查间隔（分钟）；进程被意外终止后最多这么久自动拉起，`0` 关闭 |
 | `-Days` | `7` | `report` 显示最近多少天 |
 | `-Json` | 关 | `status` / `report` 以 JSON 输出，便于其他程序读取 |
 | `-Watch` / `-Live` | 关 | `run` 模式下在控制台实时刷新速率 |
@@ -252,6 +253,46 @@ powershell -ExecutionPolicy Bypass -File .\TrafficMonitor.ps1 -Action report -Da
 ```powershell
 # 以管理员身份打开 PowerShell 再执行
 .\TrafficMonitor.ps1 -Action install -InstallMode startup
+```
+
+### 4.7 自愈：进程被杀掉也会自己回来
+
+长期驻留的服务最怕"悄悄死掉" —— 用户不会天天去看它还在不在。所以 `install` 会注册**两个触发器**：
+
+| 触发器 | 作用 |
+| --- | --- |
+| `LogonTrigger`（或 `BootTrigger`） | 登录/开机后立刻开始计数 |
+| `TimeTrigger` + `Repetition=PT5M`（**无限期**重复） | 每 5 分钟让调度器检查一次；配合 `MultipleInstances=IgnoreNew`，正在跑时新实例被**直接忽略**（不产生额外进程、不耗 CPU），一旦进程被意外终止，最多 5 分钟自动拉起 |
+
+两个坑记一下：
+
+- **`-RepetitionDuration` 千万别给 `[TimeSpan]::MaxValue`** —— PowerShell 会生成 `P99999999DT23H59M59S`，注册时报
+  `The task XML contains a value which is incorrectly formatted or out of range`。
+  正确做法是**完全不给 Duration**，这才是真正的"无限期"：
+  ```powershell
+  New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+  # → <Repetition><Interval>PT5M</Interval><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>
+  ```
+- **`New-ScheduledTaskSettingsSet` 默认生成 `StopOnIdleEnd=true`**，而 PS 5.1 **没有 `New-ScheduledTaskIdleSettings`**
+  这个 cmdlet（我实测报 `CommandNotFoundException`），所以只能导出 XML 改值再注册：
+  ```powershell
+  $xml = Export-ScheduledTask -TaskName TrafficMonitor
+  $patched = $xml -replace '(<StopOnIdleEnd[^>]*>)true(</StopOnIdleEnd>)', '${1}false${2}'
+  Register-ScheduledTask -TaskName TrafficMonitor -Xml $patched -Force
+  ```
+
+**断一小段也不丢数据**：网卡计数器一直在累加，重启后按差值一次性补计，所以自愈间隔内的流量不会丢。
+
+```powershell
+.\TrafficMonitor.ps1 -Action install -WatchdogMinutes 2   # 改成 2 分钟
+.\TrafficMonitor.ps1 -Action install -WatchdogMinutes 0   # 关闭自愈
+```
+
+想事后追因（计划任务的操作日志默认关闭，且**开启需要管理员**）：
+
+```powershell
+wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true
+Get-WinEvent -LogName Microsoft-Windows-TaskScheduler/Operational -MaxEvents 30
 ```
 
 ---
@@ -374,6 +415,50 @@ $t = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)
 
 ---
 
+### 案例：上传流量飙到 3.4 MB/s，一路排查到 Moonlight 串流
+
+现象：`status` 显示 20 分钟上传了 **2.19 GB**，而接收只有 8 MB —— 典型的"只发不收"。
+
+**排查路径（按顺序排除）：**
+
+| 步骤 | 手段 | 结果 |
+| --- | --- | --- |
+| ① 定位到哪块网卡 | 各网卡 10 秒增量对比 | 只有 `以太网` 在发（3.4 MB/s），`Mihomo`/`Tailscale`/`WLAN`/热点网卡都是 0 |
+| ② 怀疑代理 | Clash 的 `/connections` 接口（`127.0.0.1:9097`，secret 从 `clash-verge-check.yaml` 取） | mihomo 累计只上传 **39.6 MB**，排除 |
+| ③ 怀疑 Windows 传递优化 | `Get-DeliveryOptimizationStatus` | 无任务，排除 |
+| ④ 怀疑热点转发 | `192.168.137.x` 是 ICS 热点网段，检查 `SharedAccess` 服务 | 热点网卡 10 秒增量为 0，排除 |
+| ⑤ 怀疑 iCloud | 进程连的是 Apple 的 `17.248.216.x` | 读它的日志发现只是每 20 分钟一次的 SQLite 重复报错，排除 |
+| ⑥ **查串流服务端日志** | `Sunshine\config\sunshine.log` | **命中** |
+
+**决定性证据：**
+
+```
+[13:06:11] Info: New streaming session started [active sessions: 1]
+[13:06:12] Info: CLIENT CONNECTED
+[13:14:48] Info: CLIENT DISCONNECTED
+[13:18:54] Info: New streaming session started [active sessions: 1]
+[13:18:54] Info: CLIENT CONNECTED
+[13:18:54] Info: Creating encoder [hevc_nvenc]    ← 1080p60 / NVENC / Opus
+```
+
+实测上行 29 Mbps，正好是 1080p60 HEVC 串流的典型码率；而会话时间线（13:06–13:14、13:18:54 至今）
+与观测到的上传曲线**完全吻合**。Moonlight 的视频流走 **UDP 47998/47999/48000**，
+所以 `Get-NetTCPConnection` 里根本看不到它 —— 这也是前几步排查全部落空的原因
+（握手用的 TCP 47984/47989 在协商完成后就关了，抓的时候只剩 `Listen`）。
+
+**结论与启发：**
+
+1. 这是**局域网串流**，不消耗外网带宽，但它确实是物理网卡上的真实字节 —— 本工具按网卡计数，
+   自然把它算进"上传"。
+2. 排查"只发不收"的大流量时，**优先想到视频推流/串流**（Sunshine、DLNA、投屏、直播），
+   再看云备份、BT 做种。它们的共同特征都是"上传远大于下载"且速率**恒定**（CBR 编码）。
+3. 按网卡计数只能得到总量，**无法区分局域网和外网**。要精确区分得用 WFP/ETW 按连接统计，
+   这一版没做。
+4. 排查顺序上，"按进程看连接数"会误导：当时连接数最多的是 `verge-mihomo`（17 条），
+   但它的流量只有 39.6 MB —— **连接数多 ≠ 流量大**，必须用字节数说话。
+
+---
+
 ## 九、实测验证记录
 
 **① 内置自检**（`-Action selftest`，22 项全通过）
@@ -404,6 +489,25 @@ $t = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)
 **④ 单实例锁**
 
 第二个 `run` 实例退出码为 2，不重复计数。
+
+**⑤ 自愈能力**
+
+用 `-WatchdogMinutes 1` 安装后 `Stop-Process -Force` 强杀监测进程（模拟被外部终止，无正常停止日志），
+**50 秒后被重复触发器自动拉起**：
+
+```
+13:41:17 [INFO] 监测启动 PID=28376     ← 强杀发生在 13:41:23
+13:42:17 [INFO] 监测启动 PID=32700     ← 自愈，账本随即恢复每 5 秒更新
+```
+
+杀进程期间丢失的时间段，在重启后由网卡计数器差值一次性补回，**实测无数据丢失**。
+
+**⑥ 真实事故复盘**
+
+部署当天 13:33:50 监测进程曾被外部终止（无正常停止日志，任务状态回到 `Ready`），
+持续约 6 分钟无人察觉。事后做的两件事：关掉 `StopOnIdleEnd`、加上每 5 分钟的重复触发器。
+计划任务的操作日志默认关闭，且开启需要管理员权限，所以没能取到终止原因 ——
+这也是"给长期驻留的服务加自愈"比"事后追因"更实际的原因。
 
 ---
 

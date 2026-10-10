@@ -68,6 +68,11 @@ param(
     [ValidateSet('auto', 'startup', 'logon')]
     [string]$InstallMode = 'auto',
 
+    # 自愈检查间隔（分钟）：计划任务按此周期重复触发，已在运行则忽略（IgnoreNew）。
+    # 监测进程被意外终止时，最多这么久就会被自动拉起。0 = 关闭自愈
+    [ValidateRange(0, 1440)]
+    [int]$WatchdogMinutes = 5,
+
     # 以 JSON 输出（便于其他程序读取）
     [switch]$Json,
 
@@ -967,13 +972,22 @@ function Install-Monitor {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argLine
 
     if ($mode -eq 'startup') {
-        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $triggers = @(New-ScheduledTaskTrigger -AtStartup)
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     }
     else {
         $user = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
-        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+        $triggers = @(New-ScheduledTaskTrigger -AtLogOn -User $user)
         $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+    }
+
+    # 自愈：再加一个"每 N 分钟重复一次（无限期）"的触发器。
+    # 配合 MultipleInstances=IgnoreNew —— 正在跑时新实例被忽略，一旦进程被意外终止，
+    # 最多 N 分钟就会被重新拉起。不给 -RepetitionDuration 才是真正的"无限期"，
+    # 给 [TimeSpan]::MaxValue 会被计划任务以"超出范围"拒绝。
+    if ($WatchdogMinutes -gt 0) {
+        $triggers += New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) `
+            -RepetitionInterval (New-TimeSpan -Minutes $WatchdogMinutes)
     }
 
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -982,8 +996,16 @@ function Install-Monitor {
 
     $desc = 'TrafficMonitor 网络流量统计（跨重启累计）'
     try {
-        Register-ScheduledTask -TaskName $Script:TaskName -Action $action -Trigger $trigger `
+        Register-ScheduledTask -TaskName $Script:TaskName -Action $action -Trigger $triggers `
             -Principal $principal -Settings $settings -Description $desc -Force -ErrorAction Stop | Out-Null
+
+        # PS 5.1 没有 New-ScheduledTaskIdleSettings，默认生成的 StopOnIdleEnd=true 只能靠
+        # 导出 XML 改值再注册来关掉（避免任务在系统结束空闲状态时被调度器终止）。
+        $taskXml = Export-ScheduledTask -TaskName $Script:TaskName -ErrorAction Stop
+        $patched = $taskXml -replace '(<StopOnIdleEnd[^>]*>)true(</StopOnIdleEnd>)', '${1}false${2}'
+        if ($patched -ne $taskXml) {
+            Register-ScheduledTask -TaskName $Script:TaskName -Xml $patched -Force -ErrorAction Stop | Out-Null
+        }
     }
     catch {
         throw ("注册计划任务失败：{0}`n可尝试以管理员身份重新运行，或手动执行：`nschtasks /Create /TN TrafficMonitor /SC ONLOGON /TR `"powershell.exe $argLine`" /F" -f $_.Exception.Message)
